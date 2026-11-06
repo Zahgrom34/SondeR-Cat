@@ -12,7 +12,7 @@ What's new in v2:
   * cats remember where you left them
 
 Everything else from v1: eye tracking, cursor hunting, kneading, overheat,
-scroll paper play, naps, petting, mochi drag + wobble, startle, peek mode
+scroll paper play, naps, petting, drag + wobble, startle, peek mode
 during fullscreen video, stretch reminders, Pomodoro, AI-agent reactions.
 
 Run:  python sondercat.py       Quit: right-click a cat -> Quit
@@ -122,10 +122,11 @@ _linux_preflight_warn()
 
 try:
     from PySide6.QtCore import (Qt, QTimer, QObject, QPoint, QPointF, QRect,
-                            Signal)
+                            Signal, QRectF)
     from PySide6.QtGui import (QAction, QColor, QCursor, QFont,
                                QGuiApplication, QIcon, QPainter,
-                               QPainterPath, QPixmap, QFontMetrics, QPolygonF, QPen)
+                               QPainterPath, QPixmap, QFontMetrics, QPolygonF, QPen,
+                               QRegion, QTransform, QImage)
     from PySide6.QtWidgets import (QApplication, QColorDialog, QInputDialog,
                                    QLineEdit, QMenu, QMessageBox,
                                    QSystemTrayIcon, QVBoxLayout, QWidget)
@@ -148,6 +149,23 @@ except Exception:
 APP_NAME = "SondeR cat"
 APP_VERSION = "9.11.0"
 APP_BUILD = "0716ah"
+
+_HYPR_INPUT = None
+
+
+def global_cursor_position():
+    if _HYPR_INPUT is not None:
+        # A Qt mouse grab already has fresh X11 coordinates. Keep dragging
+        # responsive to every mouse event rather than the IPC polling rate.
+        if QGuiApplication.mouseButtons() != Qt.NoButton:
+            return QCursor.pos()
+        screens = [(s.name(), s.geometry().x(), s.geometry().y(),
+                    s.geometry().width(), s.geometry().height())
+                   for s in QGuiApplication.screens()]
+        position = _HYPR_INPUT.position(screens, QGuiApplication.platformName() == "xcb")
+        if position is not None:
+            return QPoint(*position)
+    return QCursor.pos()
 
 # Distribution channel. The GitHub build self-updates from the repo; the
 # Microsoft Store build is packaged as MSIX (read-only, Microsoft handles
@@ -404,6 +422,8 @@ class InputWatcher:
         self.scroll_accum = 0.0
         self.kb_ok = self.mouse_ok = False
         self._down = set()
+        self.hyprland = None
+        self._external_held = False
         try:
             from pynput import keyboard
             self._kb = keyboard.Listener(on_press=self._on_press,
@@ -444,6 +464,8 @@ class InputWatcher:
             pass
 
     def _on_press(self, key):
+        if self.hyprland is not None and self.hyprland.keyboard_active:
+            return  # compositor notifications cover X11 and native Wayland
         # --- global shortcuts FIRST, before any filtering, so nothing can
         # block them (Ctrl+Space ask, Ctrl+Shift+Alt+P update / +R restart) ---
         try:
@@ -515,6 +537,8 @@ class InputWatcher:
                 pass
 
     def _on_scroll(self, _x, _y, dx, dy):
+        if self.hyprland is not None and self.hyprland.keyboard_active:
+            return
         amt = abs(dy) if dy else abs(dx)
         if not amt:
             return
@@ -532,6 +556,8 @@ class InputWatcher:
         recent key activity so a MISSED release (stale _down entry) can't
         freeze the paw forever: a real hold produces OS auto-repeat, which
         keeps last_key fresh."""
+        if self.hyprland is not None and self.hyprland.keyboard_active:
+            return self._external_held and time.time() - self.last_key < 1.2
         if time.time() - max(self.last_key,
                              getattr(self, "last_any_key", 0.0)) > 1.2:
             # no key events AT ALL lately -> _down entries are phantoms.
@@ -1422,6 +1448,7 @@ class GuideGlow(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setWindowTitle("SondeR cat effects")
         self.resize(self.SIZE, self.SIZE)
         self.until = 0.0
 
@@ -1908,7 +1935,7 @@ class RockPaperScissorsGame(QWidget):
         total = 3 * isz + 2 * gap
         bx = px0 + (pw_ - total) // 2
         by = py0 + 132
-        mouse = self.mapFromGlobal(QCursor.pos())
+        mouse = self.mapFromGlobal(global_cursor_position())
         EMOJI = {"rock": "🪨", "paper": "📄", "scissors": "✂️"}
         emoji_font = QFont("Segoe UI Emoji", 34)
         for move in self.MOVES:
@@ -2213,7 +2240,7 @@ class BlackjackGame(QWidget):
     def _draw_button(self, p, rect, label, action, enabled=True):
         from PySide6.QtGui import QColor, QPen
         from PySide6.QtCore import QRectF
-        mouse = self.mapFromGlobal(QCursor.pos())
+        mouse = self.mapFromGlobal(global_cursor_position())
         hover = enabled and rect.contains(mouse)
         if enabled:
             self.buttons.append((rect, action))
@@ -2959,6 +2986,15 @@ class Manager(QObject):
             lambda: self.check_updates(manual=True))
         self.inputs.on_restart = lambda: self._call_bridge.call.emit(
             self._restart)
+        if platform.system() == "Linux" and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            from hyprland_input import HyprlandInput
+            global _HYPR_INPUT
+            _HYPR_INPUT = HyprlandInput(
+                lambda event: self._call_bridge.call.emit(
+                    lambda: self._on_hyprland_input(event)))
+            self.inputs.hyprland = _HYPR_INPUT
+            _HYPR_INPUT.start()
+            app.aboutToQuit.connect(_HYPR_INPUT.close)
         self.fs_detect = FullscreenDetector()
         self.meow = Meow()
 
@@ -2990,6 +3026,26 @@ class Manager(QObject):
         app.aboutToQuit.connect(self.save_all)
 
     # ------------------------------------------------------------- shared ---
+    def _on_hyprland_input(self, event):
+        if event == "sondercat-key":
+            now = time.time()
+            self.inputs.last_key = self.inputs.last_any_key = now
+            self.inputs.key_count += 1
+            self.inputs.key_times.append(now)
+            self.inputs._external_held = True
+            self._bridge.poked.emit()
+        elif event == "sondercat-key-up":
+            self.inputs._external_held = False
+        elif event == "sondercat-scroll":
+            self.inputs._native_scroll(1)
+        else:
+            callback = {"sondercat-ask": self.inputs.on_ask,
+                        "sondercat-escape": self.inputs.on_esc,
+                        "sondercat-update": self.inputs.on_update,
+                        "sondercat-restart": self.inputs.on_restart}.get(event)
+            if callback is not None:
+                callback()
+
     def primary(self):
         return self.cats[0] if self.cats else None
 
@@ -3104,8 +3160,9 @@ class Manager(QObject):
 
     # ------------------------------------------------------ self updater --
     UPDATE_BASE = ("https://raw.githubusercontent.com/"
-                   "Verisonder/SondeR-Cat/main/")
+                   "Zahgrom34/SondeR-Cat/main/")
     UPDATE_FILES = ["sondercat.py", "sprites.py", "sonder_agent.py",
+                    "hyprland_input.py", "hyprland/sondercat-input.conf",
                     "ANIMATIONS.md", "README.md", "requirements.txt",
                     "meow.wav", "sondercat_gray.ico",
                     "sounds/purr_pet.wav", "sounds/purr_sleep.wav"]
@@ -5078,6 +5135,34 @@ class Manager(QObject):
 
 # ------------------------------------------------------------------- cat -----
 
+class CatOverflow(QWidget):
+    """Visual overflow only; the cat's input window never changes size."""
+    def __init__(self):
+        super().__init__()
+        flags = (Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+                 | Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
+        if QGuiApplication.platformName() == "xcb":
+            flags |= Qt.X11BypassWindowManagerHint
+        self.setWindowFlags(flags)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.frame = None
+
+    def present(self, frame, position, cutout):
+        self.frame, self.cutout = frame, cutout
+        self.setGeometry(QRect(position, frame.size()))
+        if not self.isVisible():
+            self.show()
+        self.update()
+
+    def paintEvent(self, event):
+        if self.frame is not None:
+            p = QPainter(self)
+            p.drawImage(0, 0, self.frame)
+            p.end()
+
+
 class CatWindow(QWidget):
     def __init__(self, mgr, index):
         super().__init__()
@@ -5085,11 +5170,11 @@ class CatWindow(QWidget):
         self.index = index
         self.scale = int(self.ccfg.get("scale", 6))
         self.grow = 1.0
-        self.mochi = 1.0
 
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
                             | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setMouseTracking(True)
         self.setWindowTitle(APP_NAME)
         self._frame_cache = {}
@@ -5135,10 +5220,23 @@ class CatWindow(QWidget):
         self._aura_pad = 0              # extra transparent margin for the
         #                                 SUPER CAT flame (0 = normal window)
         self.drag_offset = QPoint()
-        self.mochi = 1.0
-        self._drag_target_offset = QPoint()
-        self._drag_prev_cursor = QPoint()
-        self._drag_room = 0
+        self._drag_cursor = QPoint()
+        self._drag_pose_dx = 0.0
+        self._drag_pose_dy = 0.0
+        self._last_run_pose = None
+        self._last_drawn_head = None
+        self._paint_origin = QPointF()
+        self._render_tilt = 0.0
+        self._drag_angle = 0.0
+        self._drag_angular_velocity = 0.0
+        self._drag_motion_pos = QPoint()
+        self._drag_stretch = 1.0
+        self._drag_stretch_velocity = 0.0
+        self._gaze_x = self._gaze_y = 0.0
+        self._key_seen = getattr(mgr.inputs, "key_count", 0)
+        self._key_pressed_at = [-100.0, -100.0]
+        self._key_sparks = []
+        self._overflow = None
         self._wig_dir = 0
         self._wig_times = deque(maxlen=12)
         self._wigv_dir = 0
@@ -5164,14 +5262,12 @@ class CatWindow(QWidget):
         self._cover_miss = 0
         self.perch_asleep = False
         self.wobble = 0.0
-        self._last_drag_x = 0
-        self._last_drag_dir = 0
 
         # smooth movement (float position)
         self._fx = self._fy = 0.0
         self.chase_cooldown = time.time() + random.uniform(0, 3)
         self._guard_return_at = 0.0
-        self.prev_cursor = QCursor.pos()
+        self.prev_cursor = global_cursor_position()
         self.prev_tick_t = time.time()
         self.cursor_speed = 0.0
 
@@ -5778,7 +5874,7 @@ class CatWindow(QWidget):
             "• Eyes follow your cursor; they chase fast moves\n"
             "• Kneading when you type; overheat when you type FAST\n"
             "• Paper play when you scroll; naps when idle\n"
-            "• Pet their heads! Drag = mochi dangle; shake = wobble\n"
+            "• Pet their heads! Drag = dangle with inertia and a gentle swing\n"
             "• Peek from the screen edge during fullscreen video\n"
             "• Stretch reminders, Pomodoro, AI-agent reactions\n"
             "• Add more cats from the right-click menu!")
@@ -5824,11 +5920,13 @@ class CatWindow(QWidget):
             ab.follow_tick()
         dt = min(0.2, max(1e-3, now - self.prev_tick_t))
         self.prev_tick_t = now
+        self._drag_swing_step(dt)
+        self._reaction_step(now, dt)
         mgr = self.mgr
         inputs = mgr.inputs
 
         # --- cursor speed (global), wake from sleep ---
-        cur = QCursor.pos()
+        cur = global_cursor_position()
         dist_moved = math.hypot(cur.x() - self.prev_cursor.x(),
                                 cur.y() - self.prev_cursor.y())
         self.cursor_speed = 0.7 * self.cursor_speed + 0.3 * (dist_moved / dt)
@@ -5895,24 +5993,10 @@ class CatWindow(QWidget):
             p["life"] -= 0.016
         self.notes = [p for p in self.notes if p["life"] > 0]
 
-        # --- drag: follow the cursor from the tick too, so the cat never
-        #     falls behind even when mouse events are missed ---
+        # Drag position follows the latest native event; the timer animates
+        # the spring without sampling a different cursor coordinate source.
         if self.dragging:
-            # ease the grab point up to the paws so the cursor "holds" them
-            d = self._drag_target_offset - self.drag_offset
-            if d.manhattanLength() > 2:
-                self.drag_offset += QPoint(int(d.x() * 0.35),
-                                           int(d.y() * 0.35))
-            curp = QCursor.pos()
-            target = curp - self.drag_offset
-            if target != self.pos():
-                self.move(target)
-                self._sync_float()
-            # mochi: hangs slightly stretched, pulls longer with speed
-            speed = (curp - self._drag_prev_cursor).manhattanLength()
-            self._drag_prev_cursor = curp
-            want = min(1.40, 1.06 + speed / 180.0)
-            self.mochi += (want - self.mochi) * 0.30
+            self._follow_drag()
             self.state = DRAG
             if self.perch_hwnd is not None or self.perch_pending is not None:
                 self._end_perch(go_home=False)
@@ -5976,7 +6060,6 @@ class CatWindow(QWidget):
                         "y": r.top() + 6, "vy": 1.3, "life": 1.2,
                         "seed": random.random() * 6})
                 self.wobble *= 0.92
-                self.mochi += (1.0 - self.mochi) * 0.35
                 self.update()
                 return
             mgr.anim_test = None
@@ -6001,7 +6084,6 @@ class CatWindow(QWidget):
                                  "vy": 0.7, "life": 2.5,
                                  "seed": random.random() * 6})
             self.wobble *= 0.92
-            self.mochi += (1.0 - self.mochi) * 0.35
             self.update()
             return
 
@@ -6018,7 +6100,6 @@ class CatWindow(QWidget):
                                  "vy": 0.7, "life": 2.5,
                                  "seed": random.random() * 6})
             self.wobble *= 0.92
-            self.mochi += (1.0 - self.mochi) * 0.35
             self.update()
             return
 
@@ -6299,7 +6380,6 @@ class CatWindow(QWidget):
             self._set_grow(False)
 
         self.wobble *= 0.92
-        self.mochi += (1.0 - self.mochi) * 0.35   # spring back after drag
         self.update()
 
     # ------------------------------------------------------------- peeking --
@@ -6413,6 +6493,150 @@ class CatWindow(QWidget):
             self.move(nx, ny)
 
     # -------------------------------------------------------- mouse events --
+    def _drag_swing_step(self, dt):
+        # A damped pendulum: movement drives the lean, gravity returns it to
+        # vertical. Sample the bounded target so holding at an edge adds no
+        # energy. Only the timer integrates physics, never individual events.
+        target_angle = 0.0
+        target_stretch = 1.0
+        if self.dragging:
+            position = self._drag_position(self._drag_cursor)
+            delta = position - self._drag_motion_pos
+            vx = delta.x() / max(dt, 1e-3)
+            speed = math.hypot(delta.x(), delta.y()) / max(dt, 1e-3)
+            self._drag_motion_pos = position
+            target_angle = max(-14.0, min(14.0, vx / 90.0))
+            target_stretch = min(1.55, 1.08 + speed / 3200.0)
+        remaining = min(dt, 0.1)
+        while remaining > 1e-9:
+            step = min(remaining, 1.0 / 120.0)
+            acceleration = (100.0 * (target_angle - self._drag_angle)
+                            - 14.0 * self._drag_angular_velocity)
+            self._drag_angular_velocity += acceleration * step
+            self._drag_angle += self._drag_angular_velocity * step
+            self._drag_angle = max(-16.0, min(16.0, self._drag_angle))
+            self._drag_stretch_velocity += (
+                110.0 * (target_stretch - self._drag_stretch)
+                - 17.0 * self._drag_stretch_velocity) * step
+            self._drag_stretch += self._drag_stretch_velocity * step
+            self._drag_stretch = max(0.97, min(1.6, self._drag_stretch))
+            remaining -= step
+        if abs(self._drag_angle) < 0.02 and abs(self._drag_angular_velocity) < 0.1:
+            self._drag_angle = self._drag_angular_velocity = 0.0
+        if abs(self._drag_stretch - 1.0) < 0.002 and abs(self._drag_stretch_velocity) < 0.01:
+            self._drag_stretch = 1.0
+            self._drag_stretch_velocity = 0.0
+
+    def _reaction_step(self, now, dt):
+        head = self.mapToGlobal(QPoint(self.cat_rect().center().x(),
+                                      self.cat_rect().top() + 9 * self.scale))
+        cursor = global_cursor_position()
+        blend = 1.0 - math.exp(-14.0 * dt)
+        self._gaze_x += (max(-1.0, min(1.0, (cursor.x() - head.x()) / 220.0))
+                         - self._gaze_x) * blend
+        self._gaze_y += (max(-1.0, min(1.0, (cursor.y() - head.y()) / 180.0))
+                         - self._gaze_y) * blend
+        inputs = self.mgr.inputs
+        count = getattr(inputs, "key_count", 0)
+        if count != self._key_seen:
+            self._key_seen = count
+            if (not self.dragging and not self.peeking
+                    and not self.gcfg.get("guard_mode", False)
+                    and not self.gcfg.get("force_sleep", False)):
+                side = 0 if count & 1 else 1
+                self._key_pressed_at[side] = now
+                for _ in range(3):
+                    self._key_sparks.append({
+                        "side": side, "x": (6.5 if side == 0 else 19) * self.scale,
+                        "y": 22 * self.scale,
+                        "vx": (-1 if side == 0 else 1) * random.uniform(24, 36) * self.scale,
+                        "vy": -random.uniform(12, 20) * self.scale,
+                        "life": 0.85, "size": random.uniform(0.9, 1.25) * self.scale})
+                self._key_sparks = self._key_sparks[-36:]
+        for spark in self._key_sparks:
+            spark["x"] += spark["vx"] * dt
+            spark["y"] += spark["vy"] * dt
+            spark["vy"] += 35 * self.scale * dt
+            spark["life"] -= dt
+        self._key_sparks = [s for s in self._key_sparks if s["life"] > 0]
+
+    def _safe_drag_tilt(self, angle, name):
+        if self.dragging or abs(self._drag_stretch - 1.0) > 0.01:
+            return angle             # the overflow layer has room for the swing
+        # Keep the rotated art inside the existing window. No window resize
+        # or position correction is needed, including at a screen corner.
+        cells = [(x, y) for y, row in enumerate(sprites.FRAMES[name])
+                 for x, cell in enumerate(row) if cell != "."]
+        if not cells:
+            return 0.0
+        xs, ys = zip(*cells)
+        # Cover either facing direction and leave a pixel for painted edges.
+        left = min(min(xs), sprites.GRID_W - 1 - max(xs))
+        right = max(max(xs) + 1, sprites.GRID_W - min(xs))
+        r = self.cat_rect()
+        unit = self.scale * self.grow
+        bounds = QRectF(r.x() + left * unit - 1,
+                        r.y() + min(ys) * unit - 1,
+                        (right - left) * unit + 2,
+                        (max(ys) - min(ys) + 1) * unit + 2)
+        pivot = self.drag_offset
+        def fits(degrees):
+            transform = QTransform()
+            transform.translate(pivot.x(), pivot.y())
+            transform.rotate(degrees)
+            transform.translate(-pivot.x(), -pivot.y())
+            return QRectF(self.rect()).contains(transform.mapRect(bounds))
+        if fits(angle):
+            return angle
+        low, high = 0.0, 1.0
+        for _ in range(8):
+            fraction = (low + high) / 2
+            if fits(angle * fraction):
+                low = fraction
+            else:
+                high = fraction
+        return angle * low
+
+    def _drag_position(self, cursor):
+        target = cursor - self.drag_offset
+        screens = QGuiApplication.screens()
+        if not screens:
+            return target
+        # Adjacent monitors form one drag surface. Permit straddling their
+        # shared edge, but not a physical outer edge or a gap between screens.
+        desktop = QRegion()
+        for screen in screens:
+            desktop = desktop.united(QRegion(screen.availableGeometry()))
+        footprint = QRegion(QRect(target, self.size()))
+        if footprint.subtracted(desktop).isEmpty():
+            return target
+        # Use the cursor's screen, not the window's: window.screen() can lag
+        # behind during a monitor crossing. Keep the complete native window
+        # on that screen so the compositor never has to push it back for us.
+        screen = QGuiApplication.screenAt(cursor)
+        if screen is None:
+            def distance(screen):
+                g = screen.geometry()
+                dx = max(g.left() - cursor.x(), 0, cursor.x() - g.right())
+                dy = max(g.top() - cursor.y(), 0, cursor.y() - g.bottom())
+                return dx * dx + dy * dy
+            screen = min(screens, key=distance)
+        g = screen.availableGeometry()
+        right = max(g.left(), g.right() + 1 - self.width())
+        bottom = max(g.top(), g.bottom() + 1 - self.height())
+        return QPoint(max(g.left(), min(target.x(), right)),
+                      max(g.top(), min(target.y(), bottom)))
+
+    def _follow_drag(self):
+        # Native mouse events are the single source of drag coordinates.
+        # Mixing them with IPC/Qt cursor polling can pull the window back to
+        # an older position between events, especially on scaled monitors.
+        target = self._drag_position(self._drag_cursor)
+        if target != self.pos():
+            self.move(target)
+            self._sync_float()
+        self.update()
+
     def wheelEvent(self, ev):
         amt = abs(ev.angleDelta().y()) / 120.0 or 1.0
         self.mgr.inputs._native_scroll(amt)
@@ -6440,28 +6664,64 @@ class CatWindow(QWidget):
                     "HEY! hands off! 😾", "do NOT grab the guard!",
                     "hsss!! 😾", "I'm ARMED, you know.",
                     "unauthorized touch!!"]), 1.6)
+            old_frame = self._frame_name()
+            caught_running = self.state == CHASE or self.glide_target is not None
+            if old_frame != "dangle":
+                self._drag_pose_dx = 0.0
+                old_eyes = sprites.EYE_CELLS.get(old_frame)
+                new_eyes = sprites.EYE_CELLS["dangle"]
+                self._drag_pose_dy = (
+                    (sum(y for _, y in old_eyes) / len(old_eyes)
+                     - sum(y for _, y in new_eyes) / len(new_eyes))
+                    * self.scale * self.grow if old_eyes else 0.0)
             self.dragging = True
+            self.state = DRAG
+            self.wobble = 0.0
+            self.jump_until = 0.0
             self.glide_target = None
             self._parachute = False       # grabbed mid-air: chute packed away
             self._falling = False
-            self.drag_offset = ev.globalPosition().toPoint() - self.pos()
-            # the cat should hang from its raised paws (top-center of sprite)
-            self._drag_target_offset = QPoint(
-                self.width() // 2,
-                TOP_MARGIN + int(1.5 * self.scale))
-            self._drag_prev_cursor = ev.globalPosition().toPoint()
-            self._drag_room = int(0.42 * sprites.GRID_H * self.scale)
-            self.setFixedSize(self.width(), self.height() + self._drag_room)
-            self._last_drag_x = ev.globalPosition().toPoint().x()
-            self._last_drag_dir = 0
+            self._drag_cursor = ev.globalPosition().toPoint()
+            # The local event position remains correct even if a compositor
+            # configure notification has not caught up with QWidget.pos().
+            self.drag_offset = (ev.position().toPoint() if hasattr(ev, "position")
+                                else self._drag_cursor - self.pos())
+            self._drag_angle = self._drag_angular_velocity = 0.0
+            pose = self._last_run_pose
+            if (caught_running and pose is not None
+                    and time.monotonic() - pose["at"] < 0.25
+                    and pose["unit"] == self.scale * self.grow):
+                # The running art is both lifted and rotated around its
+                # centre. Transfer its displayed head position and lean to
+                # the grab pivot instead of resetting those transforms.
+                self._drag_angle = max(-16.0, min(16.0, pose["angle"]))
+                rotation = QTransform()
+                rotation.translate(self.drag_offset.x(), self.drag_offset.y())
+                rotation.rotate(self._drag_angle)
+                rotation.translate(-self.drag_offset.x(), -self.drag_offset.y())
+                unrotated = rotation.inverted()[0].map(pose["head"])
+                r = self.cat_rect()
+                eyes = sprites.EYE_CELLS["dangle"]
+                ex = sum(x + sprites.EYE_W / 2 for x, _ in eyes) / len(eyes)
+                ey = sum(y + sprites.EYE_H / 2 for _, y in eyes) / len(eyes)
+                self._drag_pose_dx = unrotated.x() - (r.x() + ex * pose["unit"])
+                self._drag_pose_dy = unrotated.y() - (r.y() + ey * pose["unit"])
+            self._drag_stretch = 1.0
+            self._drag_stretch_velocity = 0.0
+            self._drag_motion_pos = self._drag_position(self._drag_cursor)
+            self.prev_tick_t = time.time()
+            self.chase_cooldown = time.time() + 2.0
+            self.update()
         elif ev.button() == Qt.RightButton:
             self.build_menu().exec(ev.globalPosition().toPoint())
 
     def mouseReleaseEvent(self, ev):
         if ev.button() == Qt.LeftButton and self.dragging:
+            # Honor the release position even when the last move was coalesced.
+            self._drag_cursor = ev.globalPosition().toPoint()
+            self.move(self._drag_position(self._drag_cursor))
             self.dragging = False
-            self._drag_room = 0
-            self._resize_to_sprite()
+            self.chase_cooldown = time.time() + 1.0
             if self.state == DRAG:
                 self.state = IDLE
             self._sync_float()
@@ -6478,15 +6738,8 @@ class CatWindow(QWidget):
     def mouseMoveEvent(self, ev):
         gp = ev.globalPosition().toPoint()
         if self.dragging:
-            self.move(gp - self.drag_offset)
-            self._sync_float()
-            dx = gp.x() - self._last_drag_x
-            if abs(dx) > 3:
-                direction = 1 if dx > 0 else -1
-                if direction != self._last_drag_dir and self._last_drag_dir:
-                    self.wobble = min(self.wobble + 4.5, 16)
-                self._last_drag_dir = direction
-            self._last_drag_x = gp.x()
+            self._drag_cursor = gp
+            self._follow_drag()
             return
         if self.state in (IDLE, KNEAD, SLEEP, THINK, PEEK):
             x0, y0, x1, y1 = (sprites.PEEK_HEAD_RECT if self.state == PEEK
@@ -7063,6 +7316,8 @@ class CatWindow(QWidget):
     # -------------------------------------------------------------- render --
     def _frame_name(self):
         now = time.time()
+        if self.dragging or abs(self._drag_stretch - 1.0) > 0.02:
+            return "dangle"
         slow = int(now / 0.36) % 2          # time-based: smooth at any fps
         fast = int(now / 0.18) % 2
         if getattr(self, "_falling", False) and self.glide_target is not None:
@@ -7375,7 +7630,7 @@ class CatWindow(QWidget):
 
         Positioned in SPRITE CELL units off the rect the frame was actually
         drawn into — NOT off cat_rect() — so the costume inherits the jump,
-        the CHASE bob, the mochi sag and the wobble tilt for free. Anchoring it
+        the CHASE bob and the wobble tilt for free. Anchoring it
         to cat_rect() instead would leave the hat hanging in mid-air every time
         the cat hops to gloat about a hand it just won.
 
@@ -7431,8 +7686,103 @@ class CatWindow(QWidget):
                                           sx + 0.5 + grow * 2,
                                           sy + 0.5 + grow * 2), col)
 
+    def hideEvent(self, event):
+        if self._overflow is not None:
+            self._overflow.hide()
+        super().hideEvent(event)
+
+    def closeEvent(self, event):
+        if self._overflow is not None:
+            self._overflow.close()
+        super().closeEvent(event)
+
     def paintEvent(self, _ev):
-        p = QPainter(self)
+        overflow = (self.dragging or abs(self._drag_stretch - 1.0) > 0.01
+                    or abs(self._drag_angle) > 0.05
+                    or self.state in (KNEAD, OVERHEAT) or bool(self._key_sparks))
+        if overflow:
+            margin = max(100, 24 * self.scale)
+            frame = QImage(self.width() + margin * 2, self.height() + margin * 2,
+                           QImage.Format_ARGB32_Premultiplied)
+            frame.fill(Qt.transparent)
+            p = QPainter(frame)
+            p.translate(margin, margin)
+            self._paint_scene(p)
+            p.end()
+            main = QPainter(self)
+            # Draw the entire effect on ONE surface. Stitching a cropped
+            # centre and a second clipped surface can leave a visible seam
+            # when the compositor presents their frames at different times.
+            main.setCompositionMode(QPainter.CompositionMode_Source)
+            main.fillRect(self.rect(), Qt.transparent)
+            main.end()
+            if self._overflow is None:
+                self._overflow = CatOverflow()
+            self._overflow.present(frame, self.pos() - QPoint(margin, margin),
+                                   QRect(margin, margin, self.width(), self.height()))
+        else:
+            if self._overflow is not None:
+                self._overflow.hide()
+            p = QPainter(self)
+            self._paint_scene(p)
+            p.end()
+
+    def _draw_reactive_sprite(self, p, img, target, name, flip, now):
+        if name == "dangle":
+            # Raised paws occupy extra rows above the face in this sprite.
+            # Align the face with its pre-grab position rather than visibly
+            # dropping the whole cat as soon as the pose changes.
+            target = QRectF(target).translated(self._drag_pose_dx, self._drag_pose_dy)
+        unit = target.width() / sprites.GRID_W
+        head_top = target.y()
+        if name == "dangle" and abs(self._drag_stretch - 1.0) > 0.002:
+            split = 15 * self.scale
+            head_height = 15 * unit
+            anchor_extra = max(0.0, self.drag_offset.y() - target.y() - head_height)
+            anchor_extra *= self._drag_stretch - 1.0
+            top = target.y() - anchor_extra
+            head_top = top
+            p.drawImage(QRectF(target.x(), top, target.width(), head_height), img,
+                        QRectF(0, 0, img.width(), split))
+            p.drawImage(QRectF(target.x(), top + head_height, target.width(),
+                               (target.height() - head_height) * self._drag_stretch),
+                        img, QRectF(0, split, img.width(), img.height() - split))
+        elif name.startswith("type_"):
+            split = 21 * self.scale
+            top_height = 21 * unit
+            depths = [max(0.0, 1.0 - (now - t) / 0.20) ** 2
+                      for t in self._key_pressed_at]
+            if flip:
+                depths.reverse()
+            bob = max(depths) * unit * 0.35
+            head_top += bob
+            p.drawImage(QRectF(target.x(), target.y() + bob, target.width(), top_height),
+                        img, QRectF(0, 0, img.width(), split))
+            for side, depth in enumerate(depths):
+                x = target.x() + side * target.width() / 2
+                # Each key presses independently and springs back to its
+                # baseline, with enough room below the original sprite.
+                p.drawImage(QRectF(x, target.y() + top_height + depth * 2 * unit,
+                                   target.width() / 2, target.height() - top_height),
+                            img, QRectF(side * img.width() / 2, split,
+                                        img.width() / 2, img.height() - split))
+        else:
+            p.drawImage(target, img)
+        eyes = sprites.EYE_CELLS.get(name)
+        if eyes:
+            ex = sum(x + sprites.EYE_W / 2 for x, _ in eyes) / len(eyes)
+            ey = sum(y + sprites.EYE_H / 2 for _, y in eyes) / len(eyes)
+            if flip:
+                ex = sprites.GRID_W - ex
+            head = QPointF(target.x() + ex * unit, head_top + ey * unit)
+            self._last_drawn_head = p.transform().map(head) - self._paint_origin
+            if name.startswith("run_"):
+                self._last_run_pose = {"head": QPointF(self._last_drawn_head),
+                                       "angle": self._render_tilt,
+                                       "unit": unit, "at": time.monotonic()}
+
+    def _paint_scene(self, p):
+        self._paint_origin = p.transform().map(QPointF())
         p.setRenderHint(QPainter.Antialiasing, False)
         now = time.time()
         s = self.scale
@@ -7452,7 +7802,7 @@ class CatWindow(QWidget):
                           and not self.dragging
                           and not self.mgr.cfg["global"].get(
                               "guard_mode", False)))
-        if flip_state:
+        if flip_state and name != "dangle":
             scr = (self.screen() or QGuiApplication.primaryScreen()).geometry()
             cat_cx = self.x() + self.width() // 2
             screen_mid = (scr.left() + scr.right()) // 2
@@ -7541,17 +7891,14 @@ class CatWindow(QWidget):
                 offx = int((-1 if left_side else 1) * (s * 0.7) + drift)
                 offy = s // 4
             else:
-                cur = QCursor.pos()
-                c = self.mapToGlobal(self.cat_rect().center())
-                ang = math.atan2(cur.y() - c.y(), cur.x() - c.x())
-                f = min(1.0, self._dist_to_cursor(cur) / 300)
-                offx = int(round(math.cos(ang) * f * (s * 0.75)))
-                offy = int(round(math.sin(ang) * f * (s * 0.75)))
+                offx = self._gaze_x * s * 0.7
+                offy = self._gaze_y * s * 0.55
             pal = (sprites.OVERHEAT_PALETTE if self.state == OVERHEAT
                    else self.palette())
             pc = QColor(pal["P"])
             ew_x, ew_y = sprites.EYE_W * s, sprites.EYE_H * s
-            pw = 2 * s                     # pupil size (px)
+            pw = max(2, int(2.2 * s))       # large, bright, rounded pixel eyes
+            ph = max(2, int(2.4 * s))
             pp = QPainter(img)
             if power:
                 # all-seeing mode: glowing blue eyes while the brain works
@@ -7578,8 +7925,17 @@ class CatWindow(QWidget):
             for (ex, ey) in eyes:
                 bx, by = ex * s, ey * s
                 px = max(bx, min(bx + offx + (ew_x - pw) // 2, bx + ew_x - pw))
-                py = max(by, min(by + offy + (ew_y - pw) // 2, by + ew_y - pw))
-                pp.fillRect(px, py, pw, pw, pc)
+                py = max(by, min(by + offy + (ew_y - ph) // 2, by + ew_y - ph))
+                px, py = int(round(px)), int(round(py))
+                corner = max(1, s // 3)
+                pp.fillRect(px + corner, py, pw - 2 * corner, ph, pc)
+                pp.fillRect(px, py + corner, pw, ph - 2 * corner, pc)
+                pp.fillRect(px + pw // 3, py + ph // 3,
+                            max(1, pw // 2), max(1, ph // 2), pc.darker(190))
+                pp.fillRect(px + corner, py + corner, max(1, s * 2 // 3),
+                            max(1, s * 2 // 3), QColor("#fffaf2"))
+                pp.fillRect(px + pw - corner - 1, py + ph - corner - 1,
+                            max(1, s // 3), max(1, s // 3), QColor("#e9fff4"))
                 if power:                  # white spark in the pupil core
                     pp.fillRect(px + pw // 4, py + pw // 4,
                                 max(1, pw // 3), max(1, pw // 3),
@@ -7614,8 +7970,13 @@ class CatWindow(QWidget):
         r = self.cat_rect()
 
         p.save()
+        swing = self._safe_drag_tilt(self._drag_angle, name) if self._drag_angle else 0.0
+        if swing:
+            p.translate(self.drag_offset)
+            p.rotate(swing)
+            p.translate(-self.drag_offset)
         tilt = 0.0
-        if self.wobble > 0.5:
+        if self.wobble > 0.5 and not self.dragging:
             tilt += math.sin(now * 18) * self.wobble
         if getattr(self, "_parachute", False) and self.glide_target is not None:
             # ☂ gentle pendulum swing under the canopy
@@ -7626,15 +7987,10 @@ class CatWindow(QWidget):
             p.translate(r.center())
             p.rotate(tilt)
             p.translate(-r.center())
+        self._render_tilt = swing + tilt
         tw_, th_ = r.width(), r.height()
         tx, ty = r.left(), r.top() + jy
-        if self.mochi > 1.02:                # mochi: sag down from the paws
-            m = self.mochi
-            th_ = int(r.height() * m)
-            tw_ = int(r.width() / (m ** 0.5))
-            tx = r.center().x() - tw_ // 2
-            ty = r.top() + jy
-        elif self.state == DANCE:            # groove: bounce + sway
+        if self.state == DANCE:            # groove: bounce + sway
             ph = math.sin(time.time() * 2 * math.pi * 1.9)
             th_ = int(r.height() * (0.955 + 0.045 * ph))
             tw_ = int(r.width() * (1.0 + 0.05 * (1.0 - th_ / r.height())))
@@ -7712,17 +8068,30 @@ class CatWindow(QWidget):
                     zx, zy = nx, ny
                 p.setPen(Qt.NoPen)
             p.restore()
-        p.drawImage(QRect(tx, ty, tw_, th_), img)
+        self._draw_reactive_sprite(p, img, QRect(tx, ty, tw_, th_), name, face_flip, now)
         # 🎩 dealer costume — INSIDE the save/restore, so the hat and moustache
         # rotate with the wobble tilt exactly like the sprite they sit on.
         if getattr(self, "cards_watching", False):
             self._draw_dealer_props(p, tx, ty, tw_, th_)
         p.restore()
 
+        for spark in self._key_sparks:
+            p.save()
+            p.setOpacity(min(1.0, spark["life"] / 0.25))
+            sx = r.left() + spark["x"]
+            if face_flip:
+                sx = r.right() - spark["x"]
+            sy, size = r.top() + spark["y"], spark["size"]
+            p.fillRect(QRectF(sx, sy + size * 0.35, size * 1.5, size), QColor("#5d5360"))
+            p.fillRect(QRectF(sx, sy, size * 1.5, size), QColor("#f3dfbf"))
+            p.fillRect(QRectF(sx + size * 0.25, sy + size * 0.2, size * 0.6, size * 0.2),
+                       QColor("#fffaf0"))
+            p.restore()
+
         # 🔫 duck-hunt blaster: drawn in screen space, pivoting at the cat's
         # paw and pointing at the cursor (where you're about to shoot).
         if self.duck_gunner:
-            cur = QCursor.pos()
+            cur = global_cursor_position()
             paw = self.mapToGlobal(self.cat_rect().center())
             paw_local = self.cat_rect().center()
             ang = math.atan2(cur.y() - paw.y(), cur.x() - paw.x())
@@ -7927,7 +8296,6 @@ class CatWindow(QWidget):
             p.drawRoundedRect(cx0, cy0, cw, chh, 3, 3)
             p.setPen(QColor("#ffffff"))
             p.drawText(QRect(cx0, cy0, cw, chh), Qt.AlignCenter, chip)
-        p.end()
 
 
 def main():

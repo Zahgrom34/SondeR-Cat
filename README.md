@@ -1,5 +1,10 @@
 # SondeR cat 🐾
 
+This fork adds Hyprland global input, drag inertia and body stretching,
+mouse-following eyes with catchlights, and animated keycaps with visual overflow.
+It is based on [Verisonder/SondeR-Cat](https://github.com/Verisonder/SondeR-Cat).
+Original code and art are by Verisonder; the Apache-2.0 license and credits are retained.
+
 A pixel cat that lives on your desktop — naps on your windows, vibes to your music, and can even answer questions with a Gemini brain.
 For **Windows** and **Linux**. Free, open source, no telemetry, no accounts.
 
@@ -10,12 +15,12 @@ For **Windows** and **Linux**. Free, open source, no telemetry, no accounts.
 ## Features
 
 **Reacts to you**
-- 👀 **Eye follow** — pupils track your cursor anywhere on screen; it blinks now and then too
+- 👀 **Eye follow** — pupils with catchlights track your cursor across the screen; it blinks now and then too
 - 🔴 **Laser hunt** — wiggle the cursor side-to-side like a laser dot and the cat gallops after it (adjustable sensitivity); wiggle up-down at the bottom edge to send it to hide
 - 🐾 **Purring pets** — rub its head with the mouse for a few seconds → hearts, a "purrr…", and a real purr sound (and it purrs softly in its sleep too). Set the sound volume in the Behavior menu — slide it all the way to 0 to mute
-- 🍡 **Mochi drag** — grab it and it hangs from your cursor by its paws, stretching like mochi as you swing it; shake for wobble
+- 🍡 **Mochi drag** — the body stretches with movement while the face keeps its shape; it swings with inertia and settles under gravity
 - 😾 **Startle** — buzz the cursor past it and it jumps
-- ⌨️ **Keyboard kneading** — types along with you on tiny 3D keycaps, stops the moment you do
+- ⌨️ **Keyboard kneading** — the keycaps press independently as you type, with small key effects that float beyond the sprite
 - 🔥 **Overheat mode** — type too fast and the whole cat turns red with steam puffing over its head
 - 📜 **Paper unroll** — scroll and it unspools a paper roll with a torn edge
 
@@ -66,6 +71,10 @@ For **Windows** and **Linux**. Free, open source, no telemetry, no accounts.
 
 ### Windows — one tiny installer
 
+The installer below installs the **original upstream version**. To run this
+fork on Windows, clone this repository, install `requirements.txt` into a
+Python virtual environment, and run `sondercat.py` with that environment's Python.
+
 **[Download SondeR_cat_setup.exe](https://github.com/Verisonder/SondeR-Cat/raw/main/SondeR_cat_setup.exe)** (140 KB) and double-click it.
 
 A small graphical installer (no terminal, ever) does the rest:
@@ -94,7 +103,7 @@ so it works even where the exe is blocked.
 ### Linux
 
 ```bash
-git clone https://github.com/Verisonder/SondeR-Cat.git
+git clone https://github.com/Zahgrom34/SondeR-Cat.git
 cd SondeR-Cat && ./install.sh
 ```
 
@@ -116,7 +125,8 @@ content diffs to the app files, so they never reset that trust.
 | Environment | Status |
 |---|---|
 | **X11 / Xorg** (any distro) | ✅ Everything works |
-| **Wayland with XWayland** (default on Ubuntu, Fedora, etc.) | ✅ Auto-detected — the cat routes itself through XWayland for full features |
+| **Hyprland with XWayland** | Global mouse, typing and scroll reactions through Hyprland IPC; enable the activity bindings below |
+| **Other Wayland sessions with XWayland** | Window positioning works through XWayland; global input hooks are limited to X11 apps |
 | **Pure Wayland** (no XWayland) | ⚠️ Runs, but global cursor tracking / hooks / self-positioning are restricted by Wayland's security model — the cat tells you at startup |
 | **GNOME** | ✅ Note: GNOME hides system trays — just right-click the *cat* for the full menu |
 
@@ -150,6 +160,19 @@ command for your distro. If the window ever fails to open:
 - **Linux** — see the support matrix above; `install.sh` diagnoses most
   issues, and the app prints exact package commands if display libraries
   are missing.
+
+### Hyprland global input
+
+Add this to your Hyprland configuration, using your checkout's absolute path:
+
+```ini
+source = /absolute/path/to/SondeR-Cat/hyprland/sondercat-input.conf
+```
+
+Run `hyprctl reload`, then restart the cat. It reads the global cursor through
+Hyprland IPC, including monitor offsets and fractional scaling. The bindings
+send anonymous typing and scroll activity while passing input through to the
+focused app; they never send typed characters and do not run on the lockscreen.
 
 ## Customizing the art
 
